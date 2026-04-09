@@ -1,21 +1,23 @@
 package main
 
 import (
-	"bytes"
 	"compress/bzip2"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
+	pathpkg "path/filepath"
 	"sort"
 	"sync"
-	"github.com/valyala/gozstd"
+
+	"github.com/klauspost/compress/zstd"
 
 	humanize "github.com/dustin/go-humanize"
-	xz "github.com/spencercw/go-xz"
+	"github.com/ulikunitz/xz"
 	"github.com/vbauerster/mpb/v5"
 	"github.com/vbauerster/mpb/v5/decor"
 	"google.golang.org/protobuf/proto"
@@ -30,7 +32,8 @@ type request struct {
 
 // Payload is a new format for the Android OTA/Firmware update files since Android Oreo
 type Payload struct {
-	Filename string
+	Filename   string
+	BaseOffset int64
 
 	file                 *os.File
 	header               *payloadHeader
@@ -64,6 +67,9 @@ type payloadHeader struct {
 }
 
 func (ph *payloadHeader) ReadFromPayload() error {
+	if _, err := ph.payload.file.Seek(ph.payload.BaseOffset, 0); err != nil {
+		return err
+	}
 	buf := make([]byte, 4)
 	if _, err := ph.payload.file.Read(buf); err != nil {
 		return err
@@ -136,6 +142,14 @@ func (p *Payload) Open() error {
 	return nil
 }
 
+// Close releases the payload file descriptor
+func (p *Payload) Close() error {
+	if p.file != nil {
+		return p.file.Close()
+	}
+	return nil
+}
+
 func (p *Payload) readManifest() (*chromeos_update_engine.DeltaArchiveManifest, error) {
 	buf := make([]byte, p.header.ManifestLen)
 	if _, err := p.file.Read(buf); err != nil {
@@ -150,7 +164,7 @@ func (p *Payload) readManifest() (*chromeos_update_engine.DeltaArchiveManifest, 
 }
 
 func (p *Payload) readMetadataSignature() (*chromeos_update_engine.Signatures, error) {
-	if _, err := p.file.Seek(int64(p.header.Size+p.header.ManifestLen), 0); err != nil {
+	if _, err := p.file.Seek(p.BaseOffset+int64(p.header.Size+p.header.ManifestLen), 0); err != nil {
 		return nil, err
 	}
 
@@ -191,7 +205,7 @@ func (p *Payload) Init() error {
 
 	// Update sizes
 	p.metadataSize = int64(p.header.Size + p.header.ManifestLen)
-	p.dataOffset = p.metadataSize + int64(p.header.MetadataSignatureLen)
+	p.dataOffset = p.BaseOffset + p.metadataSize + int64(p.header.MetadataSignatureLen)
 
 	fmt.Println("Found partitions:")
 	for i, partition := range p.deltaArchiveManifest.Partitions {
@@ -221,27 +235,57 @@ func (p *Payload) readDataBlob(offset int64, length int64) ([]byte, error) {
 	return buf, nil
 }
 
-func (p *Payload) Extract(partition *chromeos_update_engine.PartitionUpdate, out *os.File) error {
+// zeroReader is a stateless reader that produces an infinite stream of zero bytes
+// without allocating memory. Replaces the old pattern of make([]byte, hugeSize).
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
+// progressWriter is an io.Writer that updates an mpb.Bar
+type progressWriter struct {
+	w   io.Writer
+	bar *mpb.Bar
+}
+
+func (pw *progressWriter) Write(p []byte) (n int, err error) {
+	n, err = pw.w.Write(p)
+	pw.bar.IncrBy(n)
+	return n, err
+}
+
+// Extract decompresses and writes a single partition image to the output file.
+// sourceFile must be an independently opened handle (not shared across goroutines)
+// to avoid race conditions with concurrent ReadAt calls on Windows.
+func (p *Payload) Extract(partition *chromeos_update_engine.PartitionUpdate, out *os.File, sourceFile *os.File) error {
 	name := partition.GetPartitionName()
 	info := partition.GetNewPartitionInfo()
-	totalOperations := len(partition.Operations)
-	barName := fmt.Sprintf("%s (%s)", name, humanize.Bytes(info.GetSize()))
+	// totalOperations is no longer used for sizing since we scale by Bytes
+	barName := fmt.Sprintf("%s", name)
+
 	bar := p.progress.AddBar(
-		int64(totalOperations),
+		int64(info.GetSize()),
 		mpb.PrependDecorators(
 			decor.Name(barName, decor.WCSyncSpaceR),
 		),
 		mpb.AppendDecorators(
+			decor.CountersKibiByte("% .2f / % .2f"),
+			decor.Name(" | "),
 			decor.Percentage(),
 		),
 	)
 	defer bar.SetTotal(0, true)
 
+	writer := &progressWriter{w: out, bar: bar}
+
 	for _, operation := range partition.Operations {
 		if len(operation.DstExtents) == 0 {
 			return fmt.Errorf("Invalid operation.DstExtents for the partition %s", name)
 		}
-		bar.Increment()
 
 		e := operation.DstExtents[0]
 		dataOffset := p.dataOffset + int64(operation.GetDataOffset())
@@ -252,12 +296,24 @@ func (p *Payload) Extract(partition *chromeos_update_engine.PartitionUpdate, out
 		}
 		expectedUncompressedBlockSize := int64(e.GetNumBlocks() * blockSize)
 
-		bufSha := sha256.New()
-		teeReader := io.TeeReader(io.NewSectionReader(p.file, dataOffset, dataLength), bufSha)
+		// Only compute SHA256 when we have an expected hash to compare against
+		expectedHash := hex.EncodeToString(operation.GetDataSha256Hash())
+		needVerify := expectedHash != ""
+
+		sectionReader := io.NewSectionReader(sourceFile, dataOffset, dataLength)
+		var dataReader io.Reader
+		var bufSha hash.Hash
+
+		if needVerify {
+			bufSha = sha256.New()
+			dataReader = io.TeeReader(sectionReader, bufSha)
+		} else {
+			dataReader = sectionReader
+		}
 
 		switch operation.GetType() {
 		case chromeos_update_engine.InstallOperation_REPLACE:
-			n, err := io.Copy(out, teeReader)
+			n, err := io.Copy(writer, dataReader)
 			if err != nil {
 				return err
 			}
@@ -265,46 +321,47 @@ func (p *Payload) Extract(partition *chromeos_update_engine.PartitionUpdate, out
 			if int64(n) != expectedUncompressedBlockSize {
 				return fmt.Errorf("Verify failed (Unexpected bytes written): %s (%d != %d)", name, n, expectedUncompressedBlockSize)
 			}
-			break
 
 		case chromeos_update_engine.InstallOperation_REPLACE_XZ:
-			reader := xz.NewDecompressionReader(teeReader)
-			n, err := io.Copy(out, &reader)
+			reader, err := xz.NewReader(dataReader)
+			if err != nil {
+				return fmt.Errorf("Failed to create xz reader for %s: %v", name, err)
+			}
+			n, err := io.Copy(writer, reader)
 			if err != nil {
 				return err
 			}
-			reader.Close()
 			if n != expectedUncompressedBlockSize {
 				return fmt.Errorf("Verify failed (Unexpected bytes written): %s (%d != %d)", name, n, expectedUncompressedBlockSize)
 			}
-
-			break
 
 		case chromeos_update_engine.InstallOperation_REPLACE_BZ:
-			reader := bzip2.NewReader(teeReader)
-			n, err := io.Copy(out, reader)
+			reader := bzip2.NewReader(dataReader)
+			n, err := io.Copy(writer, reader)
 			if err != nil {
 				return err
 			}
 			if n != expectedUncompressedBlockSize {
 				return fmt.Errorf("Verify failed (Unexpected bytes written): %s (%d != %d)", name, n, expectedUncompressedBlockSize)
 			}
-			break
 
 		case chromeos_update_engine.InstallOperation_ZSTD:
-			reader := gozstd.NewReader(teeReader)
-			n, err := io.Copy(out, reader)
+			reader, err := zstd.NewReader(dataReader)
+			if err != nil {
+				return fmt.Errorf("Failed to create zstd reader for %s: %v", name, err)
+			}
+			n, err := io.Copy(writer, reader)
+			reader.Close()
 			if err != nil {
 				return err
 			}
 			if n != expectedUncompressedBlockSize {
 				return fmt.Errorf("Verify failed (Unexpected bytes written): %s (%d != %d)", name, n, expectedUncompressedBlockSize)
 			}
-			break
 
 		case chromeos_update_engine.InstallOperation_ZERO:
-			reader := bytes.NewReader(make([]byte, expectedUncompressedBlockSize))
-			n, err := io.Copy(out, reader)
+			// Use a zero reader instead of allocating a huge byte slice
+			n, err := io.CopyN(writer, zeroReader{}, expectedUncompressedBlockSize)
 			if err != nil {
 				return err
 			}
@@ -312,17 +369,17 @@ func (p *Payload) Extract(partition *chromeos_update_engine.PartitionUpdate, out
 			if n != expectedUncompressedBlockSize {
 				return fmt.Errorf("Verify failed (Unexpected bytes written): %s (%d != %d)", name, n, expectedUncompressedBlockSize)
 			}
-			break
 
 		default:
 			return fmt.Errorf("Unhandled operation type: %s", operation.GetType().String())
 		}
 
-		// verify hash
-		hash := hex.EncodeToString(bufSha.Sum(nil))
-		expectedHash := hex.EncodeToString(operation.GetDataSha256Hash())
-		if expectedHash != "" && hash != expectedHash {
-			return fmt.Errorf("Verify failed (Checksum mismatch): %s (%s != %s)", name, hash, expectedHash)
+		// Verify hash only if expected hash exists
+		if needVerify {
+			hash := hex.EncodeToString(bufSha.Sum(nil))
+			if hash != expectedHash {
+				return fmt.Errorf("Verify failed (Checksum mismatch): %s (%s != %s)", name, hash, expectedHash)
+			}
 		}
 	}
 
@@ -330,18 +387,36 @@ func (p *Payload) Extract(partition *chromeos_update_engine.PartitionUpdate, out
 }
 
 func (p *Payload) worker() {
+	// Each worker opens its own file handle to the payload to avoid
+	// race conditions with concurrent ReadAt calls (especially on Windows
+	// where ReadAt is implemented as non-atomic Seek+Read).
+	sourceFile, err := os.Open(p.Filename)
+	if err != nil {
+		fmt.Printf("Worker failed to open payload file: %v\n", err)
+		// Drain remaining requests to avoid deadlock
+		for range p.requests {
+			p.workerWG.Done()
+		}
+		return
+	}
+	defer sourceFile.Close()
+
 	for req := range p.requests {
 		partition := req.partition
 		targetDirectory := req.targetDirectory
 
 		name := fmt.Sprintf("%s.img", partition.GetPartitionName())
-		filepath := fmt.Sprintf("%s/%s", targetDirectory, name)
-		file, err := os.OpenFile(filepath, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0o755)
+		outPath := pathpkg.Join(targetDirectory, name)
+		outFile, err := os.OpenFile(outPath, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0o755)
 		if err != nil {
+			fmt.Printf("Failed to create output file %s: %v\n", outPath, err)
+			p.workerWG.Done()
+			continue
 		}
-		if err := p.Extract(partition, file); err != nil {
-			fmt.Println(err.Error())
+		if err := p.Extract(partition, outFile, sourceFile); err != nil {
+			fmt.Printf("Extract error for %s: %v\n", name, err)
 		}
+		outFile.Close()
 
 		p.workerWG.Done()
 	}
@@ -379,8 +454,10 @@ func (p *Payload) ExtractSelected(targetDirectory string, partitions []string) e
 		}
 	}
 
-	p.workerWG.Wait()
+	// Close channel first so workers can exit their range loop,
+	// then wait for all in-flight extractions to finish.
 	close(p.requests)
+	p.workerWG.Wait()
 
 	return nil
 }

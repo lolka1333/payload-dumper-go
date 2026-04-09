@@ -4,7 +4,6 @@ import (
 	"archive/zip"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"runtime"
@@ -12,36 +11,24 @@ import (
 	"time"
 )
 
-func extractPayloadBin(filename string) string {
+func getPayloadOffset(filename string) (int64, error) {
 	zipReader, err := zip.OpenReader(filename)
 	if err != nil {
-		log.Fatalf("Not a valid zip archive: %s\n", filename)
+		return 0, fmt.Errorf("not a valid zip archive: %s: %v", filename, err)
 	}
 	defer zipReader.Close()
 
 	for _, file := range zipReader.Reader.File {
 		if file.Name == "payload.bin" && file.UncompressedSize64 > 0 {
-			zippedFile, err := file.Open()
+			offset, err := file.DataOffset()
 			if err != nil {
-				log.Fatalf("Failed to read zipped file: %s\n", file.Name)
+				return 0, fmt.Errorf("failed to get data offset: %w", err)
 			}
-
-			tempfile, err := os.CreateTemp(os.TempDir(), "payload_*.bin")
-			if err != nil {
-				log.Fatalf("Failed to create a temp file located at %s\n", tempfile.Name())
-			}
-			defer tempfile.Close()
-
-			_, err = io.Copy(tempfile, zippedFile)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			return tempfile.Name()
+			return offset, nil
 		}
 	}
 
-	return ""
+	return 0, fmt.Errorf("payload.bin not found inside archive")
 }
 
 func main() {
@@ -74,21 +61,25 @@ func main() {
 	}
 
 	payloadBin := filename
+	var payloadOffset int64 = 0
+
 	if strings.HasSuffix(filename, ".zip") {
-		fmt.Println("Please wait while extracting payload.bin from the archive.")
-		payloadBin = extractPayloadBin(filename)
-		if payloadBin == "" {
-			log.Fatal("Failed to extract payload.bin from the archive.")
-		} else {
-			defer os.Remove(payloadBin)
+		offset, err := getPayloadOffset(filename)
+		if err != nil {
+			log.Fatalf("Failed to map payload.bin from archive: %v\n", err)
 		}
+		payloadOffset = offset
+		fmt.Printf("Mapped payload.bin from zip at data offset: %d\n", payloadOffset)
+	} else {
+		fmt.Printf("payload.bin: %s\n", payloadBin)
 	}
-	fmt.Printf("payload.bin: %s\n", payloadBin)
 
 	payload := NewPayload(payloadBin)
+	payload.BaseOffset = payloadOffset
 	if err := payload.Open(); err != nil {
 		log.Fatal(err)
 	}
+	defer payload.Close()
 	payload.Init()
 
 	if list {
